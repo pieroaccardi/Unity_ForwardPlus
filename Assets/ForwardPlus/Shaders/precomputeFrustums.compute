@@ -1,0 +1,48 @@
+﻿#pragma kernel CSMain
+#pragma enable_d3d11_debug_symbols 
+
+#define BLOCK_SIZE 16
+
+#include "Common.cginc"
+
+RWStructuredBuffer<Frustum> frustums;
+
+struct CS_INPUT
+{
+	uint3 Gid : SV_GroupID;
+	uint3 GTid : SV_GroupThreadID;
+	uint3 DTid : SV_DispatchThreadID;
+	uint GI : SV_GroupIndex;
+};
+
+float4 data; //inverse of the resolution and number of groups
+float4x4 InverseProjection;
+
+[numthreads(BLOCK_SIZE, BLOCK_SIZE,1)]
+void CSMain (CS_INPUT input)
+{
+	float2 points[4];
+	points[0] = input.DTid.xy * BLOCK_SIZE * data.xy * float2(2, -2) - float2(1, -1);
+	points[1] = (input.DTid.xy + float2(1, 0)) * BLOCK_SIZE * data.xy * float2(2, -2) - float2(1, -1);
+	points[2] = (input.DTid.xy + float2(0, 1)) * BLOCK_SIZE * data.xy * float2(2, -2) - float2(1, -1);
+	points[3] = (input.DTid.xy + float2(1, 1)) * BLOCK_SIZE * data.xy * float2(2, -2) - float2(1, -1);
+
+	float4 viewSpacePoints[4];
+	for (int i = 0; i < 4; ++i)
+		viewSpacePoints[i] = NDCtoViewSpace(float4(points[i], 0, 1), InverseProjection); //z from 1 to 0 
+
+	float3 origin = float3(0, 0, 0);
+
+	Frustum frustum;
+
+	frustum.planes[0] = ComputePlane(origin, viewSpacePoints[2], viewSpacePoints[0]);
+	frustum.planes[1] = ComputePlane(origin, viewSpacePoints[0], viewSpacePoints[1]);
+	frustum.planes[2] = ComputePlane(origin, viewSpacePoints[1], viewSpacePoints[3]);
+	frustum.planes[3] = ComputePlane(origin, viewSpacePoints[3], viewSpacePoints[2]);
+
+	if (input.DTid.x < data.z && input.DTid.y < data.w)
+	{
+		uint index = input.DTid.y * data.z + input.DTid.x;
+		frustums[index] = frustum;
+	}
+}

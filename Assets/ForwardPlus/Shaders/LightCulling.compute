@@ -1,0 +1,103 @@
+﻿#pragma kernel CSMain
+#pragma enable_d3d11_debug_symbols 
+
+#define BLOCK_SIZE 16
+
+#include "Common.cginc"
+
+struct CS_INPUT
+{
+	uint3 Gid : SV_GroupID;
+	uint3 GTid : SV_GroupThreadID;
+	uint3 DTid : SV_DispatchThreadID;
+	uint GI : SV_GroupIndex;
+};
+
+float4 data;
+float4x4 InverseProjection;
+float4x4 WorldToViewMatrix;
+
+StructuredBuffer<Frustum> frustums;
+Texture2D depthBuffer;
+StructuredBuffer<Light> lights;  //array with all lights and their properties
+RWBuffer<uint> currentIndex; 
+RWBuffer<uint> lightsIndexBuffer;
+
+RWTexture2D<uint2> lightsGrid;
+
+groupshared uint maxDepth;
+groupshared uint minDepth;
+groupshared uint lightsCount;
+groupshared uint startIndexOffset;
+groupshared uint indices[64]; 
+groupshared Frustum groupFrustum;
+
+void AppendLight(uint lightIndex)
+{
+	uint index;
+	InterlockedAdd(lightsCount, 1, index); //add 1 to the number of group lights
+	if (index < 64)
+	{
+		indices[index] = lightIndex;  //indices is the local indices list
+	}
+}
+
+[numthreads(BLOCK_SIZE, BLOCK_SIZE,1)]
+void CSMain (CS_INPUT input)
+{
+	uint2 texcoord = input.DTid.xy;  //screen coordinates
+	texcoord.y = 1.0 / data.y - texcoord.y;
+	float depth = 1.0 - depthBuffer.Load(int3(texcoord, 0)).r;  //read the depth and invert
+	uint intDepth = asuint(depth);  //convert to int for atomic operations
+	
+	if (input.GI == 0)  //primo group thread
+	{
+		minDepth = 0xffffffff;
+		maxDepth = 0;
+		lightsCount = 0;
+		groupFrustum = frustums[input.Gid.x + input.Gid.y * data.z];
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	InterlockedMin(minDepth, intDepth);  //atomic operations
+	InterlockedMax(maxDepth, intDepth);
+
+	GroupMemoryBarrierWithGroupSync();
+
+	float fMin = asfloat(minDepth);  //convert to float
+	float fMax = asfloat(maxDepth);
+
+	float minInViewSpace = NDCtoViewSpace(float4(0, 0, 1 - fMin, 1), InverseProjection).z; //also here the z is inverted
+	float maxInViewSpace = NDCtoViewSpace(float4(0, 0, 1 - fMax, 1), InverseProjection).z;
+
+	//the number of thread in the group is 256, as the number of light to process, so every thread processes its own light
+
+	Light light = lights[input.GI];
+	if (light.Enabled)
+	{
+		float3 lightViewSpacePosition = mul(WorldToViewMatrix, float4(light.PositionWorldSpace, 1));
+		
+		Sphere sphere = { lightViewSpacePosition , light.range };
+
+		if (SphereInsideFrustum(sphere, groupFrustum, minInViewSpace, maxInViewSpace))
+		{
+			AppendLight(input.GI);
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (input.GI == 0) 
+	{
+		InterlockedAdd(currentIndex[0], lightsCount, startIndexOffset);
+		lightsGrid[input.Gid.xy] = uint2(startIndexOffset, lightsCount);
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	for (int i = input.GI; i < lightsCount; i += BLOCK_SIZE * BLOCK_SIZE)
+	{
+		lightsIndexBuffer[startIndexOffset + i] = indices[i];
+	}
+}
